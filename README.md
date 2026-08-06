@@ -1,93 +1,154 @@
-# Fraud Detection — Unsupervised vs Supervised Approach
+# Fraud Detection — XGBoost + FastAPI + Claude Agent
 
-A comparative study of two strategies for detecting fraudulent credit-card applications:
+A full end-to-end fraud detection system combining machine learning, a REST API, Docker, and an AI agent.
+
+---
+
+## Results
 
 | Approach | Model | Labels needed? | ROC-AUC |
 |---|---|---|---|
 | Unsupervised | Isolation Forest | No | 0.524 |
-| Supervised | Logistic Regression | Yes | **0.872** |
+| Supervised | Logistic Regression | Yes | 0.872 |
+| Supervised | **XGBoost** | Yes | **0.8818** |
+
+---
 
 ## Dataset
 
-This project uses the [**Bank Account Fraud Dataset Suite (NeurIPS 2022)**](https://www.kaggle.com/datasets/sgpjesus/bank-account-fraud-dataset-neurips-2022) from Kaggle — a set of realistic, synthetic tabular datasets designed for evaluating ML models on biased, imbalanced, and dynamic fraud-detection tasks.
+This project uses the [**Bank Account Fraud Dataset Suite (NeurIPS 2022)**](https://www.kaggle.com/datasets/sgpjesus/bank-account-fraud-dataset-neurips-2022) from Kaggle — realistic, synthetic tabular datasets for evaluating ML models on imbalanced fraud-detection tasks.
 
-## Problem
+Fraud rate: ~1.1% (heavily imbalanced)
 
-Given a dataset of credit-card applications with behavioural, demographic, and device features, flag the ones that are likely fraudulent. Fraud is rare (~1.1 % of applications), making this a heavily imbalanced classification problem.
+---
 
 ## Project Structure
 
 ```
-├── README.md
-├── Rubrik_test.ipynb        # Main analysis notebook
-├── Base_unlabeled.csv       # Raw application data (no fraud labels)
-└── Base.csv                 # Same data with ground-truth fraud_bool column
+├── Credit_Card_Fraud_DS_Project.ipynb   # Main analysis notebook
+├── API/
+│   ├── api.py                           # FastAPI app + Claude Agent endpoint
+│   ├── agent.py                         # Standalone Claude Agent
+│   ├── train_xgboost.py                 # XGBoost training script
+│   ├── fraud_model.joblib               # Saved model
+│   ├── Dockerfile                       # Docker container
+│   └── requirements.txt                 # Dependencies
+└── README.md
 ```
+
+---
 
 ## Notebook Walkthrough
 
-### 1 · Setup & Imports
-Standard data-science stack: pandas, numpy, matplotlib, seaborn, scikit-learn.
+### 1 · EDA
+- Inspect sentinel values (`-1` used as missing indicator)
+- Identify columns with excessive missingness (`prev_address_months_count` at 71%)
+- Analyse feature correlations and distributions
 
-### 2 · Exploratory Data Analysis
-- Inspect sentinel values (`-1` used as a missing indicator in several columns).
-- Analyse pairwise co-occurrence and lift of missing values.
-- Identify columns with excessive missingness (e.g. `prev_address_months_count` at 71 %).
+### 2 · Data Cleaning & Feature Engineering
+- Drop `prev_address_months_count` (too sparse)
+- Engineer `balance_to_income_ratio`
+- Replace `-1` sentinels with `NaN`
+- Build `ColumnTransformer` pipeline: median imputation + scaling for numerics, one-hot encoding for categoricals
 
-### 3 · Data Cleaning & Feature Engineering
-- Drop `prev_address_months_count` (too sparse, near-zero correlation with other features).
-- Engineer `balance_to_income_ratio`.
-- Replace `-1` sentinels with `NaN` for proper imputation.
-- Build a `ColumnTransformer` pipeline: median imputation + standard scaling for numerics, one-hot encoding for categoricals, mode imputation for binary flags.
+### 3 · Unsupervised — KMeans & Isolation Forest
+- KMeans: silhouette ≈ 0.07 — no meaningful cluster structure
+- Isolation Forest: ROC-AUC 0.524 — weak signal without labels
 
-### 3a · KMeans Clustering
-- Elbow and silhouette analysis show no meaningful cluster structure (silhouette ≈ 0.07).
-- Dimensionality reduction does not help — KMeans is the wrong tool for sparse-anomaly data.
+### 4 · Supervised — Logistic Regression
+- GridSearchCV over regularisation strength
+- ROC-AUC: **0.872**
 
-### 3b · Isolation Forest (Unsupervised)
-- Fit an Isolation Forest on the full unlabeled dataset.
-- Extract anomaly scores; inspect the 1 000 most anomalous rows.
-- PCA projection shows anomalies concentrating in one region, but explained variance is low (~18 %).
+### 5 · Supervised — XGBoost
+- `scale_pos_weight=89.7` to handle class imbalance
+- ROC-AUC: **0.8818**
+- Saved model with `joblib`
 
-### 4 · Logistic Regression (Supervised)
-- Re-load data with ground-truth labels.
-- GridSearchCV over regularisation strength; best model uses L2 with C = 0.001.
-- **ROC-AUC 0.872** vs Isolation Forest's 0.524 — supervision makes a dramatic difference.
-- At the default 0.5 threshold: 78.8 % recall but only 4.3 % precision (flags ~20 % of traffic).
+---
 
-### 5 · Next Steps
-- Train a gradient-boosted model (LightGBM) for stronger performance.
-- Optimise the decision threshold to match a realistic alerting budget.
+## API
+
+### Run with Docker
+
+```bash
+docker build -t fraud-api .
+docker run -p 8000:8000 -e ANTHROPIC_API_KEY=your_key fraud-api
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/predict` | POST | Predict fraud from structured transaction data |
+| `/agent` | POST | Analyze transaction described in natural language |
+| `/chat` | GET | Web UI for the Claude Agent |
+| `/docs` | GET | Auto-generated API documentation |
+| `/health` | GET | Health check |
+
+### Example — `/predict`
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"income": 0.9, "customer_age": 60, "credit_risk_score": 131, ...}'
+```
+
+Response:
+```json
+{
+  "fraud_probability": 0.7919,
+  "is_fraud": true,
+  "risk_level": "HIGH"
+}
+```
+
+### Example — `/agent`
+
+```bash
+curl -X POST http://localhost:8000/agent \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Customer age 20, very low income, no valid phones, device has 2 prior fraud cases..."}'
+```
+
+Response:
+```json
+{
+  "analysis": "HIGH RISK (79%). Red flags: device fraud history, 17 distinct DOB-linked emails...",
+  "model": "XGBoost + Claude"
+}
+```
+
+---
+
+## Claude Agent
+
+The project includes a Claude-powered AI agent that:
+- Accepts transaction descriptions in **natural language**
+- Extracts parameters automatically
+- Calls the XGBoost model via the API
+- Returns a detailed explanation of the risk factors
+
+Open `http://localhost:8000/chat` for a web chat interface.
+
+---
 
 ## Key Takeaways
 
-- **Isolation Forest alone is not enough** for this fraud dataset — the anomaly signal is too weak (AUC barely above random).
-- **Logistic Regression with balanced class weights** provides a solid supervised baseline, though precision at the default threshold is low due to extreme class imbalance.
-- **Feature engineering matters**: the `balance_to_income_ratio` and velocity features contribute the most discriminative power.
+- **Isolation Forest alone is not enough** — anomaly signal too weak (AUC barely above random)
+- **XGBoost with balanced class weights** outperforms Logistic Regression (0.8818 vs 0.872)
+- **Feature engineering matters**: `balance_to_income_ratio` and velocity features are most discriminative
+- **LLM + ML** combination enables natural language fraud analysis
+
+---
 
 ## Requirements
 
-```
-python >= 3.10
-pandas
-numpy
-matplotlib
-seaborn
-scikit-learn
-```
-
-Install with:
-
 ```bash
-pip install pandas numpy matplotlib seaborn scikit-learn
+pip install -r requirements.txt
 ```
 
-## Usage
-
-```bash
-jupyter notebook Rubrik_test.ipynb
-```
+---
 
 ## License
 
-This project is for educational and evaluation purposes.
+Educational and evaluation purposes.
