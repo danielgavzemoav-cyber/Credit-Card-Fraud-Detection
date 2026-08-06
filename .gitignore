@@ -1,0 +1,6 @@
+data/Base.csv
+data/Base_unlabeled.csv
+data/.~lock*
+**/__pycache__/
+**/.idea/
+**/*.pyc
