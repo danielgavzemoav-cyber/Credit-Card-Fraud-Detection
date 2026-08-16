@@ -3,7 +3,7 @@ import requests
 import json
 
 # ← שים את ה-API key שלך כאן
-client = anthropic.Anthropic(api_key="YOUR_API_KEY_HERE")
+client = anthropic.Anthropic()
 
 # Tool definition — Claude ידע איך להשתמש ב-API שלנו
 tools = [

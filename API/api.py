@@ -5,9 +5,21 @@ import pandas as pd
 import numpy as np
 import joblib
 import anthropic
-import requests
 import json
 import os
+import sys
+from pathlib import Path
+import shap
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import base64
+from fastapi.responses import StreamingResponse
+
+# Make the shared src/ package importable regardless of cwd (local run vs Docker).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.engineering import create_fraud_features
 
 # Load model
 artifact = joblib.load('fraud_model.joblib')
@@ -16,6 +28,16 @@ binary_cols = artifact['binary_cols']
 num_cols    = artifact['num_cols']
 cat_cols    = artifact['cat_cols']
 sentinel_cols = artifact['sentinel_cols']
+
+preprocessor = pipeline.named_steps['preprocessor']
+model        = pipeline.named_steps['model']
+
+# SHAP needs a version-clean Booster (avoids xgboost cross-version base_score parsing bugs).
+# xgb_booster.json is a re-exported, version-normalized copy of the same trained model.
+import xgboost as xgb
+_shap_booster = xgb.Booster()
+_shap_booster.load_model('xgb_booster.json')
+shap_explainer = shap.TreeExplainer(_shap_booster)
 
 # Claude client
 claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "YOUR_API_KEY_HERE"))
@@ -112,6 +134,30 @@ tools = [
     }
 ]
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _prepare_features(transaction: Transaction) -> pd.DataFrame:
+    data = pd.DataFrame([transaction.dict()])
+    data = create_fraud_features(data, sentinel_cols=sentinel_cols)
+    return data[binary_cols + num_cols + cat_cols]
+
+def _clean_feature_name(name: str) -> str:
+    """Strip sklearn ColumnTransformer prefixes like 'num__' / 'cat__' / 'bin__'."""
+    return name.split("__", 1)[-1]
+
+def _top_shap_contributions(X: pd.DataFrame, top_n: int = 5):
+    X_transformed = preprocessor.transform(X)
+    feature_names = preprocessor.get_feature_names_out()
+    shap_values = shap_explainer.shap_values(X_transformed)
+    row = shap_values[0]
+
+    contributions = [
+        {"feature": _clean_feature_name(name), "impact": round(float(val), 4)}
+        for name, val in zip(feature_names, row)
+    ]
+    contributions.sort(key=lambda c: abs(c["impact"]), reverse=True)
+    return contributions[:top_n]
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -124,11 +170,7 @@ def health():
 
 @app.post("/predict")
 def predict(transaction: Transaction):
-    data = pd.DataFrame([transaction.dict()])
-    data['balance_to_income_ratio'] = data['intended_balcon_amount'] / data['income']
-    data['balance_to_income_ratio'] = data['balance_to_income_ratio'].replace([np.inf, -np.inf], np.nan)
-    data[sentinel_cols] = data[sentinel_cols].replace(-1, np.nan)
-    X = data[binary_cols + num_cols + cat_cols]
+    X = _prepare_features(transaction)
     fraud_proba = pipeline.predict_proba(X)[0][1]
     return {
         "fraud_probability": round(float(fraud_proba), 4),
@@ -136,16 +178,46 @@ def predict(transaction: Transaction):
         "risk_level": "HIGH" if fraud_proba >= 0.5 else "MEDIUM" if fraud_proba >= 0.2 else "LOW"
     }
 
+@app.post("/explain")
+def explain(transaction: Transaction):
+    """Predict fraud probability AND explain which features drove the decision (SHAP)."""
+    X = _prepare_features(transaction)
+    fraud_proba = pipeline.predict_proba(X)[0][1]
+    top_features = _top_shap_contributions(X, top_n=5)
+
+    return {
+        "fraud_probability": round(float(fraud_proba), 4),
+        "is_fraud": bool(fraud_proba >= 0.5),
+        "risk_level": "HIGH" if fraud_proba >= 0.5 else "MEDIUM" if fraud_proba >= 0.2 else "LOW",
+        "top_contributing_features": [
+            {
+                "feature": f["feature"],
+                "impact": f["impact"],
+                "direction": "increases risk" if f["impact"] > 0 else "decreases risk"
+            }
+            for f in top_features
+        ]
+    }
+
+@app.post("/explain/plot")
+def explain_plot(transaction: Transaction):
+    """Return a PNG bar chart of the top SHAP feature contributions for this transaction."""
+    X = _prepare_features(transaction)
+    png_bytes = _make_shap_plot(X, top_n=10)
+    return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+
 @app.post("/agent")
 def agent(request: AgentRequest):
-    """Analyze a transaction described in natural language"""
+    """Analyze a transaction described in natural language, with SHAP-grounded explanation."""
     messages = [{"role": "user", "content": request.message}]
     system = """You are a fraud detection assistant. When given transaction details,
-    use the check_fraud tool to analyze it, then explain:
-    1. Whether it's fraudulent and the probability
-    2. Key risk factors
-    3. Recommendation (approve/review/reject)
-    Be concise and clear."""
+    use the check_fraud tool to analyze it. You will receive the fraud probability
+    AND a list of the top features that actually drove the model's decision (from SHAP analysis).
+    Base your explanation ONLY on those listed features - do not invent other reasons.
+    Reply with: 1) verdict + probability, 2) the top 2-3 real contributing features and their direction,
+    3) a recommendation (approve/review/reject). Be concise."""
+
+    last_transaction = None  # ← track the most recent successfully-parsed transaction
 
     while True:
         response = claude.messages.create(
@@ -159,7 +231,6 @@ def agent(request: AgentRequest):
         if response.stop_reason == "tool_use":
             tool_use = next(b for b in response.content if b.type == "tool_use")
 
-            # Fill defaults
             defaults = {
                 "prev_address_months_count": -1,
                 "current_address_months_count": -1,
@@ -169,9 +240,9 @@ def agent(request: AgentRequest):
             }
             full_data = {**defaults, **tool_use.input}
 
-            # Call predict internally
             transaction = Transaction(**full_data)
-            api_result = predict(transaction)
+            last_transaction = transaction  # ← remember it for the plot step below
+            api_result = explain(transaction)  # ← now uses SHAP-backed explain()
 
             messages.append({"role": "assistant", "content": response.content})
             messages.append({
@@ -185,9 +256,19 @@ def agent(request: AgentRequest):
 
         elif response.stop_reason == "end_turn":
             final = next(b.text for b in response.content if hasattr(b, "text"))
+
+            plot_base64 = None
+            if last_transaction is not None:
+                # Always generate the SHAP plot for whatever transaction was actually analyzed,
+                # regardless of whether Claude's text explanation happens to mention it.
+                X = _prepare_features(last_transaction)
+                png_bytes = _make_shap_plot(X, top_n=10)
+                plot_base64 = base64.b64encode(png_bytes).decode("utf-8")
+
             return {
                 "analysis": final,
-                "model": "XGBoost + Claude"
+                "model": "XGBoost + SHAP + Claude",
+                "plot_base64": plot_base64  # ← None if no transaction was ever analyzed (e.g. "hello")
             }
 
 @app.get("/chat", response_class=HTMLResponse)
@@ -213,7 +294,8 @@ def chat_ui():
 </head>
 <body>
     <h1>🔍 Fraud Detection Agent</h1>
-    <p>Describe a transaction in natural language and the AI will analyze it.</p>
+    <p>Describe a transaction in natural language and the AI will analyze it, grounded in real SHAP feature contributions.</p>
+    <p style="font-size:13px;color:#666;">Tip: use <code>/explain/plot</code> (POST via /docs) to get a visual SHAP chart for a specific transaction.</p>
     <div id="chat"></div>
     <div id="input-area">
         <textarea id="message" rows="3" placeholder="E.g: Customer age 35, income 0.6, credit score 150, requesting 2000 credit limit, valid phones..."></textarea>
@@ -227,7 +309,6 @@ def chat_ui():
 
             const chat = document.getElementById('chat');
 
-            // Show user message
             chat.innerHTML += `<div class="user-msg">${msg}</div>`;
             chat.innerHTML += `<div class="agent-msg loading" id="loading">🤔 Analyzing...</div>`;
             chat.scrollTop = chat.scrollHeight;
@@ -243,6 +324,9 @@ def chat_ui():
 
                 document.getElementById('loading').remove();
                 chat.innerHTML += `<div class="agent-msg">🤖 ${data.analysis}</div>`;
+                if (data.plot_base64) {
+                    chat.innerHTML += `<div class="agent-msg"><img src="data:image/png;base64,${data.plot_base64}" style="max-width:100%; border-radius:8px;" /></div>`;
+                }
                 chat.scrollTop = chat.scrollHeight;
             } catch (e) {
                 document.getElementById('loading').remove();
@@ -250,7 +334,6 @@ def chat_ui():
             }
         }
 
-        // Send on Ctrl+Enter
         document.getElementById('message').addEventListener('keydown', function(e) {
             if (e.ctrlKey && e.key === 'Enter') sendMessage();
         });
@@ -258,3 +341,35 @@ def chat_ui():
 </body>
 </html>
 """
+def _make_shap_plot(X: pd.DataFrame, top_n: int = 10) -> bytes:
+    """Generate a horizontal bar chart of the top SHAP contributions and return PNG bytes."""
+    X_transformed = preprocessor.transform(X)
+    feature_names = [_clean_feature_name(n) for n in preprocessor.get_feature_names_out()]
+    shap_values = shap_explainer.shap_values(X_transformed)
+    row = shap_values[0]
+
+    order = np.argsort(np.abs(row))[::-1][:top_n]
+    labels = [feature_names[i] for i in order]
+    values = [row[i] for i in order]
+    colors = ['#ff4d6d' if v > 0 else '#4d94ff' for v in values]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    y_pos = np.arange(len(labels))[::-1]
+    ax.barh(y_pos, values, color=colors)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=10)
+    ax.axvline(0, color='#333', linewidth=0.8)
+    ax.set_xlabel("Impact on fraud probability (SHAP value)")
+    ax.set_title("Top factors driving this prediction", fontsize=12, fontweight='bold')
+    for i, v in zip(y_pos, values):
+        ax.text(v + (0.02 if v > 0 else -0.02), i, f"{v:+.2f}",
+                va='center', ha='left' if v > 0 else 'right', fontsize=9)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
