@@ -8,6 +8,7 @@ import anthropic
 import json
 import os
 import sys
+import logging
 from pathlib import Path
 import shap
 import matplotlib
@@ -16,6 +17,14 @@ import matplotlib.pyplot as plt
 import io
 import base64
 from fastapi.responses import StreamingResponse
+
+# Logs to stderr, which Docker's log driver captures automatically (`docker logs <container>`) -
+# no Dockerfile change needed to pick these up.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+transaction_logger = logging.getLogger("fraud_api.transactions")
 
 # Make the shared src/ package importable regardless of cwd (local run vs Docker).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -137,6 +146,7 @@ tools = [
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _prepare_features(transaction: Transaction) -> pd.DataFrame:
+    transaction_logger.info(json.dumps(transaction.dict()))
     data = pd.DataFrame([transaction.dict()])
     data = create_fraud_features(data, sentinel_cols=sentinel_cols)
     return data[binary_cols + num_cols + cat_cols]
